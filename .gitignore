@@ -1,6 +1,8 @@
-/__pycache__
-/ai_service.log
-/indices
-/models
-/venv
-/yolov8m.pt
+__pycache__/
+*.pyc
+.env
+ai_service.log
+venv/
+models/
+indices/
+Front-end/

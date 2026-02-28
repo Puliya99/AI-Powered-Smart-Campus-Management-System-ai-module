@@ -15,18 +15,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for better Docker caching
 COPY requirements.txt .
 
-# Install Python dependencies (CPU-only PyTorch)
+# Install Python dependencies (CPU-only PyTorch from PyTorch index)
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
-# Copy application code
+# Copy application code and model
 COPY main.py .
 COPY yolov8m.pt .
 
-# Create directories for models and indices
+# Create directories for runtime data
 RUN mkdir -p models indices
 
-# Expose port
-EXPOSE 8001
+# Render sets PORT automatically (default 10000)
+EXPOSE 10000
 
-# Use PORT env var (Render sets this automatically)
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001}
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}

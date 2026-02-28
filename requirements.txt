@@ -22,9 +22,9 @@ mediapipe==0.10.21
 opencv-python-headless==4.13.0.92
 pillow==12.1.0
 
-# PyTorch (CPU-only for Render free/starter tier)
-torch==2.10.0+cpu
-torchvision==0.25.0+cpu
+# PyTorch CPU (resolved via --extra-index-url in Dockerfile)
+torch
+torchvision
 
 # LLM APIs
 google-genai==1.59.0
@@ -38,7 +38,6 @@ python-pptx==1.0.2
 lxml==6.0.2
 
 # NLP
-nltk==3.9.2
 transformers==4.57.6
 
 # Other

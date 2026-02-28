@@ -2,5 +2,10 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.example
+.git/
+.gitignore
 ai_service.log
 Front-end/
+models/
+indices/

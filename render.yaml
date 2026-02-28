@@ -1,20 +1,13 @@
 services:
   - type: web
     name: smart-campus-ai-module
-    runtime: python
+    runtime: docker
     region: oregon
     plan: starter
-    buildCommand: |
-      pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.3"
       - key: GEMINI_API_KEY
-        sync: false  # You'll set this manually in Render dashboard
+        sync: false
       - key: GEMINI_MODEL
         value: "gemini-2.0-flash"
-      - key: PORT
-        value: "8001"
     healthCheckPath: /api/proctor/health
     autoDeploy: true
