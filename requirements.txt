@@ -8,7 +8,7 @@ pydantic==2.12.5
 # ML & Data Science
 scikit-learn==1.8.0
 pandas==2.3.3
-numpy==1.26.4
+numpy>=1.26.4,<2
 joblib==1.5.3
 scipy==1.17.0
 
@@ -16,10 +16,11 @@ scipy==1.17.0
 faiss-cpu==1.13.2
 sentence-transformers==5.2.0
 
-# Computer Vision
+# Computer Vision (pinned to numpy<2 compatible versions)
 ultralytics==8.4.17
 mediapipe==0.10.21
-opencv-python-headless==4.13.0.92
+opencv-python-headless>=4.6.0,<4.11
+opencv-contrib-python>=4.6.0,<4.11
 pillow==12.1.0
 
 # PyTorch CPU (resolved via --extra-index-url in Dockerfile)
