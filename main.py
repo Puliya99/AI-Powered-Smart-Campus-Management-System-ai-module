@@ -2,11 +2,13 @@ import os
 import io
 import json
 import math
+import time
 import base64
 import asyncio
 import datetime
 from typing import List, Optional, Dict
 from functools import partial
+from threading import Lock
 
 import joblib
 import pandas as pd
@@ -16,6 +18,8 @@ import cv2
 from PIL import Image
 import torch
 import mediapipe as mp
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks import python as mp_tasks
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,23 +104,34 @@ SUSPICIOUS_OBJECTS = {
 }
 
 # ----------------------------
-# MediaPipe Face Detection + FaceMesh (Head Pose)
+# MediaPipe Face Detection + Face Landmarker (Tasks API)
 # ----------------------------
-print("Loading MediaPipe models...")
-mp_face_detection = mp.solutions.face_detection
-mp_face_mesh = mp.solutions.face_mesh
+print("Loading MediaPipe Tasks API models...")
+TASK_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "task_models")
 
-face_detector = mp_face_detection.FaceDetection(
-    model_selection=1,  # full-range model
-    min_detection_confidence=0.7,
+face_detector = mp_vision.FaceDetector.create_from_options(
+    mp_vision.FaceDetectorOptions(
+        base_options=mp_tasks.BaseOptions(
+            model_asset_path=os.path.join(TASK_MODELS_DIR, "blaze_face_short_range.tflite")
+        ),
+        min_detection_confidence=0.7,
+        running_mode=mp_vision.RunningMode.IMAGE,
+    )
 )
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=True,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.7,
+
+face_landmarker = mp_vision.FaceLandmarker.create_from_options(
+    mp_vision.FaceLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(
+            model_asset_path=os.path.join(TASK_MODELS_DIR, "face_landmarker.task")
+        ),
+        output_face_blendshapes=True,
+        num_faces=2,
+        min_face_detection_confidence=0.7,
+        min_face_presence_confidence=0.7,
+        running_mode=mp_vision.RunningMode.IMAGE,
+    )
 )
-print("MediaPipe models loaded.")
+print("MediaPipe Tasks API models loaded.")
 
 # ----------------------------
 # Embedding Model
@@ -134,6 +149,86 @@ METADATA_PATH = os.path.join(MODEL_DIR, "metadata.json")
 # FAISS Indices storage (in-memory)
 # courseId -> {"index": faiss.IndexFlatL2(dim), "chunks": [chunk_info, ...]}
 indices: Dict[str, Dict] = {}
+
+
+# ----------------------------
+# Temporal Violation Tracking (Per-Attempt)
+# ----------------------------
+class ViolationBuffer:
+    """Thread-safe in-memory store tracking temporal violation patterns per quiz attempt."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._buffers: Dict[str, Dict] = {}
+
+    def get_or_create(self, attempt_id: str) -> Dict:
+        with self._lock:
+            if attempt_id not in self._buffers:
+                self._buffers[attempt_id] = {
+                    "no_face_start": None,
+                    "looking_away_start": None,
+                    "looking_away_direction": None,
+                    "last_seen": time.time(),
+                }
+            self._buffers[attempt_id]["last_seen"] = time.time()
+            return self._buffers[attempt_id]
+
+    def cleanup_stale(self, max_age_seconds: float = 7200):
+        """Remove attempt buffers older than 2 hours."""
+        with self._lock:
+            now = time.time()
+            stale = [k for k, v in self._buffers.items() if now - v["last_seen"] > max_age_seconds]
+            for k in stale:
+                del self._buffers[k]
+
+
+violation_buffer = ViolationBuffer()
+
+
+def _analyze_temporal_patterns(
+    attempt_id: str,
+    face_count: int,
+    looking_away: bool,
+    looking_direction: str,
+) -> List[Dict]:
+    """Track sustained violations over time for a quiz attempt."""
+    buf = violation_buffer.get_or_create(attempt_id)
+    now = time.time()
+    temporal_violations = []
+
+    # SUSTAINED_NO_FACE: no face for >5 continuous seconds
+    if face_count == 0:
+        if buf["no_face_start"] is None:
+            buf["no_face_start"] = now
+        else:
+            duration = now - buf["no_face_start"]
+            if duration >= 5.0:
+                temporal_violations.append({
+                    "type": "SUSTAINED_NO_FACE",
+                    "duration_seconds": round(duration, 1),
+                    "details": f"No face detected for {duration:.1f}s continuously",
+                })
+    else:
+        buf["no_face_start"] = None
+
+    # SUSTAINED_GAZE_DEVIATION: looking away >3 continuous seconds
+    if looking_away and face_count == 1:
+        if buf["looking_away_start"] is None:
+            buf["looking_away_start"] = now
+            buf["looking_away_direction"] = looking_direction
+        else:
+            duration = now - buf["looking_away_start"]
+            if duration >= 3.0:
+                temporal_violations.append({
+                    "type": "SUSTAINED_GAZE_DEVIATION",
+                    "duration_seconds": round(duration, 1),
+                    "details": f"Looking {buf['looking_away_direction']} for {duration:.1f}s continuously",
+                })
+    else:
+        buf["looking_away_start"] = None
+        buf["looking_away_direction"] = None
+
+    return temporal_violations
 
 
 # ----------------------------
@@ -662,8 +757,10 @@ def _sync_detect_head_pose(image_b64: str) -> HeadPoseResponse:
     rgb = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
     img_h, img_w = rgb.shape[:2]
 
-    face_results = face_detector.process(rgb)
-    face_count = len(face_results.detections) if face_results.detections else 0
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+    face_results = face_detector.detect(mp_image)
+    face_count = len(face_results.detections)
 
     if face_count == 0:
         return HeadPoseResponse(
@@ -679,15 +776,15 @@ def _sync_detect_head_pose(image_b64: str) -> HeadPoseResponse:
             violation_details=f"{face_count} faces detected",
         )
 
-    mesh_results = face_mesh.process(rgb)
+    landmarker_result = face_landmarker.detect(mp_image)
 
-    if not mesh_results.multi_face_landmarks:
+    if not landmarker_result.face_landmarks:
         return HeadPoseResponse(
             face_count=1, looking_away=False, looking_direction="center",
             eyes_closed=False, is_violation=False,
         )
 
-    landmarks = mesh_results.multi_face_landmarks[0].landmark
+    landmarks = landmarker_result.face_landmarks[0]
     head_pose = estimate_head_pose(landmarks, img_w, img_h)
     eyes_closed = detect_eyes_closed(landmarks)
 
@@ -744,6 +841,7 @@ class FullProctorRequest(BaseModel):
     image: str  # base64-encoded JPEG frame
     run_object_detection: bool = True  # skip YOLO on some frames for perf
     confidence_threshold: Optional[float] = 0.6
+    attempt_id: Optional[str] = None  # enables temporal violation tracking
 
 
 class FullProctorResponse(BaseModel):
@@ -759,9 +857,12 @@ class FullProctorResponse(BaseModel):
     # Violations
     violations: List[Dict]  # [{type, details, weight}]
     total_violation_weight: int
+    # Temporal (only when attempt_id is provided)
+    temporal_violations: Optional[List[Dict]] = None
+    attempt_id: Optional[str] = None
 
 
-def _sync_full_proctor_analyze(image_b64: str, run_object_detection: bool, confidence_threshold: float) -> FullProctorResponse:
+def _sync_full_proctor_analyze(image_b64: str, run_object_detection: bool, confidence_threshold: float, attempt_id: Optional[str] = None) -> FullProctorResponse:
     """Run blocking combined proctoring analysis in a worker thread."""
     image_data = base64.b64decode(image_b64)
     image = Image.open(io.BytesIO(image_data))
@@ -770,11 +871,12 @@ def _sync_full_proctor_analyze(image_b64: str, run_object_detection: bool, confi
     img_h, img_w = frame_bgr.shape[:2]
 
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
     violations: List[Dict] = []
 
-    face_results = face_detector.process(rgb)
-    face_count = len(face_results.detections) if face_results.detections else 0
+    face_results = face_detector.detect(mp_image)
+    face_count = len(face_results.detections)
 
     head_pose = None
     looking_away = False
@@ -786,9 +888,9 @@ def _sync_full_proctor_analyze(image_b64: str, run_object_detection: bool, confi
     elif face_count > 1:
         violations.append({"type": "MULTIPLE_FACES", "details": f"{face_count} faces detected", "weight": 2})
     else:
-        mesh_results = face_mesh.process(rgb)
-        if mesh_results.multi_face_landmarks:
-            landmarks = mesh_results.multi_face_landmarks[0].landmark
+        landmarker_result = face_landmarker.detect(mp_image)
+        if landmarker_result.face_landmarks:
+            landmarks = landmarker_result.face_landmarks[0]
             head_pose = estimate_head_pose(landmarks, img_w, img_h)
             eyes_closed = detect_eyes_closed(landmarks)
 
@@ -850,6 +952,21 @@ def _sync_full_proctor_analyze(image_b64: str, run_object_detection: bool, confi
                         "weight": weight,
                     })
 
+    # Temporal analysis (only when attempt_id is provided)
+    temporal_violations = None
+    if attempt_id:
+        temporal_violations = _analyze_temporal_patterns(
+            attempt_id, face_count, looking_away, looking_direction
+        )
+        # Add temporal violations to the main violations list
+        if temporal_violations:
+            for tv in temporal_violations:
+                violations.append({
+                    "type": tv["type"],
+                    "details": tv["details"],
+                    "weight": 2,
+                })
+
     total_weight = sum(v["weight"] for v in violations)
 
     return FullProctorResponse(
@@ -862,7 +979,26 @@ def _sync_full_proctor_analyze(image_b64: str, run_object_detection: bool, confi
         person_count=person_count,
         violations=violations,
         total_violation_weight=total_weight,
+        temporal_violations=temporal_violations,
+        attempt_id=attempt_id,
     )
+
+
+class CleanupBufferRequest(BaseModel):
+    attempt_id: Optional[str] = None
+
+@app.post("/api/proctor/cleanup-buffer")
+async def cleanup_violation_buffer(request: CleanupBufferRequest = CleanupBufferRequest()):
+    """Cleanup violation tracking buffers. If attempt_id is provided, clears only that buffer.
+    Otherwise cleans up all stale buffers (>2 hours old)."""
+    if request.attempt_id:
+        with violation_buffer._lock:
+            if request.attempt_id in violation_buffer._buffers:
+                del violation_buffer._buffers[request.attempt_id]
+        return {"status": "ok", "cleared": request.attempt_id}
+    else:
+        violation_buffer.cleanup_stale()
+        return {"status": "ok"}
 
 
 @app.post("/api/proctor/analyze", response_model=FullProctorResponse)
@@ -872,7 +1008,7 @@ async def full_proctor_analyze(request: FullProctorRequest):
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, partial(_sync_full_proctor_analyze, request.image, request.run_object_detection, request.confidence_threshold)
+            None, partial(_sync_full_proctor_analyze, request.image, request.run_object_detection, request.confidence_threshold, request.attempt_id)
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Proctor analysis failed: {str(e)}")
@@ -886,8 +1022,297 @@ async def proctor_health():
         "gpu_available": torch.cuda.is_available(),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "yolo_model": "yolov8m",
-        "mediapipe": True,
+        "mediapipe": "tasks-api",
     }
+
+
+# ----------------------------
+# Face Recognition: Identity Verification (DeepFace + ArcFace)
+# ----------------------------
+FACE_EMBEDDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_embeddings")
+os.makedirs(FACE_EMBEDDINGS_DIR, exist_ok=True)
+
+ARCFACE_THRESHOLD = 0.68  # Cosine similarity threshold for ArcFace
+
+# Lazy-load DeepFace to avoid slow startup if not needed
+_deepface_module = None
+
+
+def _get_deepface():
+    global _deepface_module
+    if _deepface_module is None:
+        from deepface import DeepFace
+        _deepface_module = DeepFace
+    return _deepface_module
+
+
+class FaceEnrollRequest(BaseModel):
+    student_id: str
+    image: str  # base64-encoded JPEG
+
+
+class FaceEnrollResponse(BaseModel):
+    success: bool
+    message: str
+    student_id: str
+
+
+class FaceVerifyRequest(BaseModel):
+    student_id: str
+    image: str  # base64-encoded JPEG
+
+
+class FaceVerifyResponse(BaseModel):
+    verified: bool
+    confidence: float
+    student_id: str
+    message: str
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    dot = float(np.dot(a, b))
+    norm_a = float(np.linalg.norm(a))
+    norm_b = float(np.linalg.norm(b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _sync_face_enroll(student_id: str, image_b64: str) -> FaceEnrollResponse:
+    """Extract ArcFace embedding and store on disk."""
+    try:
+        DeepFace = _get_deepface()
+        image_data = base64.b64decode(image_b64)
+        image = Image.open(io.BytesIO(image_data))
+        frame = np.array(image)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        embeddings = DeepFace.represent(
+            img_path=frame_bgr,
+            model_name="ArcFace",
+            enforce_detection=True,
+            detector_backend="mediapipe",
+        )
+
+        if not embeddings:
+            return FaceEnrollResponse(
+                success=False, message="No face detected in image", student_id=student_id
+            )
+
+        embedding = np.array(embeddings[0]["embedding"], dtype=np.float32)
+        embedding_path = os.path.join(FACE_EMBEDDINGS_DIR, f"{student_id}.npy")
+        np.save(embedding_path, embedding)
+
+        return FaceEnrollResponse(
+            success=True, message="Face enrolled successfully", student_id=student_id
+        )
+    except Exception as e:
+        return FaceEnrollResponse(
+            success=False, message=f"Enrollment failed: {str(e)}", student_id=student_id
+        )
+
+
+@app.post("/api/face/enroll", response_model=FaceEnrollResponse)
+async def face_enroll(request: FaceEnrollRequest):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, partial(_sync_face_enroll, request.student_id, request.image)
+    )
+
+
+def _sync_face_verify(student_id: str, image_b64: str) -> FaceVerifyResponse:
+    """Verify a face against the stored enrollment embedding."""
+    embedding_path = os.path.join(FACE_EMBEDDINGS_DIR, f"{student_id}.npy")
+
+    if not os.path.exists(embedding_path):
+        return FaceVerifyResponse(
+            verified=False, confidence=0.0, student_id=student_id,
+            message="No enrolled face found. Please enroll first.",
+        )
+
+    stored_embedding = np.load(embedding_path)
+
+    try:
+        DeepFace = _get_deepface()
+        image_data = base64.b64decode(image_b64)
+        image = Image.open(io.BytesIO(image_data))
+        frame = np.array(image)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        embeddings = DeepFace.represent(
+            img_path=frame_bgr,
+            model_name="ArcFace",
+            enforce_detection=True,
+            detector_backend="mediapipe",
+        )
+
+        if not embeddings:
+            return FaceVerifyResponse(
+                verified=False, confidence=0.0, student_id=student_id,
+                message="No face detected in verification image",
+            )
+
+        current_embedding = np.array(embeddings[0]["embedding"], dtype=np.float32)
+        similarity = _cosine_similarity(stored_embedding, current_embedding)
+
+        verified = similarity >= ARCFACE_THRESHOLD
+        return FaceVerifyResponse(
+            verified=verified,
+            confidence=round(similarity, 4),
+            student_id=student_id,
+            message="Identity verified" if verified else f"Identity mismatch (confidence: {similarity:.2%})",
+        )
+    except Exception as e:
+        return FaceVerifyResponse(
+            verified=False, confidence=0.0, student_id=student_id,
+            message=f"Verification failed: {str(e)}",
+        )
+
+
+@app.post("/api/face/verify", response_model=FaceVerifyResponse)
+async def face_verify(request: FaceVerifyRequest):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, partial(_sync_face_verify, request.student_id, request.image)
+    )
+
+
+@app.get("/api/face/check/{student_id}")
+async def check_face_enrollment(student_id: str):
+    embedding_path = os.path.join(FACE_EMBEDDINGS_DIR, f"{student_id}.npy")
+    return {"enrolled": os.path.exists(embedding_path), "student_id": student_id}
+
+
+# ── Liveness Detection ─────────────────────────────────────────────
+
+class LivenessFrame(BaseModel):
+    image: str
+    timestamp: float  # milliseconds since challenge start
+
+class LivenessRequest(BaseModel):
+    student_id: str
+    challenge_type: str  # "BLINK" or "HEAD_TURN"
+    challenge_param: str  # "3" for blink count, "LEFT" or "RIGHT" for head turn
+    frames: List[LivenessFrame]
+
+class LivenessResponse(BaseModel):
+    passed: bool
+    confidence: float
+    message: str
+    details: Optional[Dict] = None
+
+
+def _compute_ear(landmarks) -> float:
+    """Compute average Eye Aspect Ratio from landmarks."""
+    def ear(eye_indices):
+        pts = [(landmarks[i].x, landmarks[i].y) for i in eye_indices]
+        v1 = math.dist(pts[1], pts[5])
+        v2 = math.dist(pts[2], pts[4])
+        h = math.dist(pts[0], pts[3])
+        return (v1 + v2) / (2.0 * h) if h > 0 else 0
+
+    left_eye = [33, 160, 158, 133, 153, 144]
+    right_eye = [362, 385, 387, 263, 373, 380]
+    return (ear(left_eye) + ear(right_eye)) / 2.0
+
+
+def _sync_liveness_check(student_id: str, challenge_type: str, challenge_param: str, frames: List[dict]) -> dict:
+    """Analyze a sequence of frames for liveness challenge response."""
+    if len(frames) < 3:
+        return {"passed": False, "confidence": 0.0, "message": "Too few frames provided", "details": None}
+
+    ear_values = []
+    yaw_values = []
+    valid_frames = 0
+
+    for frame_data in frames:
+        try:
+            image_data = base64.b64decode(frame_data["image"])
+            image = Image.open(io.BytesIO(image_data))
+            frame = np.array(image)
+            if len(frame.shape) == 3 and frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+            elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                # Check if BGR (from cv2) or RGB (from PIL) — PIL gives RGB
+                pass  # Already RGB from PIL
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+            landmarker_result = face_landmarker.detect(mp_image)
+
+            if not landmarker_result.face_landmarks:
+                continue
+
+            landmarks = landmarker_result.face_landmarks[0]
+            valid_frames += 1
+
+            # Compute EAR for blink detection
+            avg_ear = _compute_ear(landmarks)
+            ear_values.append(avg_ear)
+
+            # Compute yaw for head turn detection
+            h, w = frame.shape[:2]
+            pose = estimate_head_pose(landmarks, w, h)
+            yaw_values.append(pose["yaw"])
+
+        except Exception:
+            continue
+
+    if valid_frames < 3:
+        return {"passed": False, "confidence": 0.1, "message": "Could not detect face in enough frames", "details": {"valid_frames": valid_frames}}
+
+    if challenge_type == "BLINK":
+        # Count blink events: EAR drops below 0.18 then rises above 0.22
+        required_blinks = int(challenge_param) if challenge_param.isdigit() else 3
+        blink_count = 0
+        in_blink = False
+        for ear_val in ear_values:
+            if not in_blink and ear_val < 0.18:
+                in_blink = True
+            elif in_blink and ear_val > 0.22:
+                blink_count += 1
+                in_blink = False
+
+        passed = blink_count >= required_blinks
+        confidence = min(1.0, blink_count / required_blinks) if required_blinks > 0 else 0.0
+        return {
+            "passed": passed,
+            "confidence": round(confidence, 2),
+            "message": f"Detected {blink_count}/{required_blinks} blinks" if passed else f"Only detected {blink_count}/{required_blinks} blinks",
+            "details": {"blink_count": blink_count, "required": required_blinks, "valid_frames": valid_frames},
+        }
+
+    elif challenge_type == "HEAD_TURN":
+        # Check if yaw exceeded ±20° in the expected direction
+        direction = challenge_param.upper()
+        if direction == "LEFT":
+            max_yaw = max(yaw_values) if yaw_values else 0
+            passed = max_yaw > 20.0
+            confidence = min(1.0, max_yaw / 20.0) if max_yaw > 0 else 0.0
+        elif direction == "RIGHT":
+            min_yaw = min(yaw_values) if yaw_values else 0
+            passed = min_yaw < -20.0
+            confidence = min(1.0, abs(min_yaw) / 20.0) if min_yaw < 0 else 0.0
+        else:
+            return {"passed": False, "confidence": 0.0, "message": f"Unknown direction: {direction}", "details": None}
+
+        return {
+            "passed": passed,
+            "confidence": round(confidence, 2),
+            "message": f"Head turn {direction.lower()} detected" if passed else f"Head turn {direction.lower()} not detected",
+            "details": {"direction": direction, "yaw_range": [round(min(yaw_values), 1), round(max(yaw_values), 1)], "valid_frames": valid_frames},
+        }
+
+    return {"passed": False, "confidence": 0.0, "message": f"Unknown challenge type: {challenge_type}", "details": None}
+
+
+@app.post("/api/face/liveness-check", response_model=LivenessResponse)
+async def liveness_check(request: LivenessRequest):
+    loop = asyncio.get_event_loop()
+    frames_data = [{"image": f.image, "timestamp": f.timestamp} for f in request.frames]
+    result = await loop.run_in_executor(
+        None,
+        partial(_sync_liveness_check, request.student_id, request.challenge_type, request.challenge_param, frames_data),
+    )
+    return LivenessResponse(**result)
 
 
 if __name__ == "__main__":
