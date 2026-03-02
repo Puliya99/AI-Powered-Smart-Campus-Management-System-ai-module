@@ -18,9 +18,10 @@ COPY requirements.txt .
 # Install Python dependencies (CPU-only PyTorch from PyTorch index)
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
-# Copy application code and model
+# Copy application code and models
 COPY main.py .
 COPY yolov8m.pt .
+COPY task_models/ task_models/
 
 # Create directories for runtime data
 RUN mkdir -p models indices
