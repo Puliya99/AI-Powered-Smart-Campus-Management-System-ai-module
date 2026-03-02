@@ -41,6 +41,10 @@ lxml==6.0.2
 # NLP
 transformers==4.57.6
 
+# Face Recognition
+deepface==0.0.93
+tf-keras>=2.16
+
 # Other
 requests==2.32.5
 httpx==0.28.1
