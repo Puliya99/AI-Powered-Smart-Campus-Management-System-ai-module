@@ -506,54 +506,55 @@ async def process_material(courseId: str = Form(...), materialId: str = Form(...
 
 
 def build_prompt(question: str, chunks: list) -> str:
-    sources = []
-    for i, c in enumerate(chunks, start=1):
-        meta = c.get("metadata", {})
-        # Include metadata so Gemini can cite properly
-        sources.append(f"[S{i}] meta={meta}\n{c['content']}")
+    """Prompt that grounds the answer in lecture materials when available,
+    but also allows the model to draw on general knowledge."""
+    if chunks:
+        sources = []
+        for i, c in enumerate(chunks, start=1):
+            meta = c.get("metadata", {})
+            sources.append(f"[S{i}] meta={meta}\n{c['content']}")
 
-    return f"""
-You are a university lecture assistant.
+        return f"""
+You are a helpful university assistant with broad academic knowledge.
+
+LECTURE MATERIAL CONTEXT (use these as your primary source when relevant):
+{chr(10).join(sources)}
 
 RULES:
-- Answer ONLY using the SOURCES.
-- If the answer is not found, say exactly: "I can't find this in the uploaded lecture materials."
-- Keep it student-friendly.
-- Add citations like [S1], [S2] after each key statement.
+- Prioritise the lecture material above when it is relevant to the question.
+- Add citations like [S1], [S2] after statements that come from the lecture material.
+- For questions not covered by the lecture material, answer using your general knowledge.
+- Always give a clear, student-friendly answer — never refuse to answer.
 
 QUESTION:
 {question}
+""".strip()
+    else:
+        return f"""
+You are a helpful university assistant with broad academic knowledge.
 
-SOURCES:
-{chr(10).join(sources)}
+Answer the following question in a clear, student-friendly way.
+
+QUESTION:
+{question}
 """.strip()
 
 
 def _sync_chat(course_id: str, question: str, top_k: int) -> dict:
     """Run all blocking chat operations (embedding, FAISS, Gemini) in a worker thread."""
-    if course_id not in indices or not indices[course_id]["chunks"]:
-        return {
-            "answer": "I don't have any materials for this course yet. Please upload some lecture notes first.",
-            "citations": [],
-        }
 
-    # 1) Embed question
-    q_emb = embed_model.encode([question])
-
-    # 2) Search FAISS
-    D, I = indices[course_id]["index"].search(q_emb.astype("float32"), top_k)
-
+    # Try to retrieve relevant lecture material chunks (best-effort — never blocks the answer)
     retrieved_chunks = []
-    for idx in I[0]:
-        if idx != -1 and idx < len(indices[course_id]["chunks"]):
-            retrieved_chunks.append(indices[course_id]["chunks"][idx])
-
-    if not retrieved_chunks:
-        return {"answer": "I can't find this in the uploaded lecture materials.", "citations": []}
+    if course_id in indices and indices[course_id]["chunks"]:
+        q_emb = embed_model.encode([question])
+        D, I = indices[course_id]["index"].search(q_emb.astype("float32"), top_k)
+        for idx in I[0]:
+            if idx != -1 and idx < len(indices[course_id]["chunks"]):
+                retrieved_chunks.append(indices[course_id]["chunks"][idx])
 
     prompt = build_prompt(question, retrieved_chunks)
 
-    # 3) Call Gemini (new SDK)
+    # Call Gemini
     if not gemini_client:
         answer = "Gemini is not configured. Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your .env and restart."
     else:
