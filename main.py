@@ -34,8 +34,7 @@ from ultralytics import YOLO
 
 from dotenv import load_dotenv
 
-# ✅ New Gemini SDK (replaces deprecated google.generativeai)
-from google import genai
+import subprocess
 
 # ----------------------------
 # Env
@@ -43,10 +42,7 @@ from google import genai
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  # start with flash (fast + usually available)
-
-# Create Gemini client only if key exists (so server can still run without it)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 app = FastAPI(title="Campus AI Analytics & RAG API")
 
@@ -554,19 +550,31 @@ def _sync_chat(course_id: str, question: str, top_k: int) -> dict:
 
     prompt = build_prompt(question, retrieved_chunks)
 
-    # Call Gemini
-    if not gemini_client:
-        answer = "Gemini is not configured. Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your .env and restart."
+    # Call Gemini via curl subprocess (Python's HTTP stack has issues with Google's HTTP/2+TLS)
+    if not GEMINI_API_KEY:
+        answer = "Gemini is not configured. Please set GEMINI_API_KEY in your .env and restart."
     else:
         try:
-            resp = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]})
+            result = subprocess.run(
+                ["curl", "-s", "--max-time", "85", "-X", "POST", url,
+                 "-H", "Content-Type: application/json", "-d", payload],
+                capture_output=True, text=True, timeout=90
             )
-            answer = resp.text or "I couldn't generate an answer. Please try again."
+            if result.returncode != 0:
+                raise RuntimeError(f"curl exit {result.returncode}: {result.stderr[:200]}")
+            data = json.loads(result.stdout)
+            if "error" in data:
+                raise RuntimeError(f"Gemini API error: {data['error'].get('message', str(data['error']))}")
+            answer = data["candidates"][0]["content"]["parts"][0]["text"]
+            answer = answer or "I couldn't generate an answer. Please try again."
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Gemini API timed out after 90s (model={GEMINI_MODEL})")
         except Exception as e:
-            print(f"Error calling Gemini: {e}")
-            answer = "I'm sorry, I'm having trouble connecting to Gemini right now."
+            error_msg = str(e)
+            print(f"[Gemini ERROR] model={GEMINI_MODEL} | {error_msg}")
+            raise RuntimeError(f"Gemini API error (model={GEMINI_MODEL}): {error_msg}")
 
     return {
         "answer": answer,
@@ -585,9 +593,17 @@ def _sync_chat(course_id: str, question: str, top_k: int) -> dict:
 @app.post("/chat")
 async def chat(request: ChatRequest):
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, partial(_sync_chat, request.courseId, request.question, request.top_k)
-    )
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None, partial(_sync_chat, request.courseId, request.question, request.top_k)
+            ),
+            timeout=95,  # 5s buffer beyond the 90s REST timeout
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Gemini model timed out. Try again or use a faster model.")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # ----------------------------
