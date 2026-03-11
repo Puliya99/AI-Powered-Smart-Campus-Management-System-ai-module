@@ -87,15 +87,23 @@ The server starts on `http://localhost:8001` by default.
 
 > **First run:** model weights (YOLOv8m, Sentence-Transformers, DeepFace) are downloaded automatically on startup. Allow a few minutes and ensure internet access.
 
+> **Gemini API transport:** The module calls Google Gemini via `curl` subprocess rather than Python's `requests`/`httpx` to avoid an ALPN/HTTP2 negotiation hang in Python's SSL stack on certain Linux environments. This is transparent — no configuration required.
+
+#### Running in the background (production)
+
+```bash
+nohup python main.py > /tmp/ai-module.log 2>&1 &
+tail -f /tmp/ai-module.log   # monitor output
+```
+
 ---
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
-| `GEMINI_API_KEY` | Google Gemini API key (also accepted as `GOOGLE_API_KEY`) | **required** |
-| `GEMINI_MODEL` | Gemini model name | `gemini-1.5-flash` |
-| `AI_SERVICE_URL` | Self-referencing service URL | `http://localhost:8001` |
+| `GEMINI_API_KEY` | Google Gemini API key | **required** |
+| `GEMINI_MODEL` | Gemini model name | `gemini-2.0-flash` |
 
 ---
 
@@ -228,6 +236,7 @@ Set `GEMINI_API_KEY` in Render's environment variable settings before deploying.
 - Trained models are versioned (`model_v1.pkl`, `model_v2.pkl`, …) with a `metadata.json` version tracker
 - Auto-detects CUDA/GPU availability; falls back to CPU
 - CORS is open (`*`) — restrict in production via a reverse proxy or FastAPI middleware
+- **Gemini calls use `curl` subprocess** — avoids a Python SSL/ALPN hang when calling Google's servers on Linux. Timeouts: curl 85 s → asyncio 95 s
 
 ---
 
